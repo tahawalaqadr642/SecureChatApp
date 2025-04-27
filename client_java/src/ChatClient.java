@@ -2,23 +2,55 @@ import java.io.*;
 import java.net.Socket;
 import java.security.PublicKey;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.function.Consumer;
-
 public class ChatClient {
     private Socket socket;
     private DataOutputStream out;
     private DataInputStream in;
     private Consumer<String> onMessageReceived;
+    private Consumer<FileReceiveRequest> onFileReceived;
     private String username;
-
+    private final Map<String, FileReceiveRequest> pendingFileRequests = new HashMap<>();
+    private int fileRequestCounter = 0;
+    public static class FileReceiveRequest {
+        private final String sender;
+        private final String fileName;
+        private final byte[] fileData;
+        private final int requestId;
+        public FileReceiveRequest(String sender, String fileName, byte[] fileData, int requestId) {
+            this.sender = sender;
+            this.fileName = fileName;
+            this.fileData = fileData;
+            this.requestId = requestId;
+        }
+        public String getSender() {
+            return sender;
+        }
+        
+        public String getFileName() {
+            return fileName;
+        }
+        
+        public byte[] getFileData() {
+            return fileData;
+        }
+        
+        public int getRequestId() {
+            return requestId;
+        }
+        
+        public long getFileSizeKB() {
+            return fileData.length / 1024;
+        }
+    }
     public void connect(String host, int port, String username) throws Exception {
         this.username = username;
         socket = new Socket(host, port);
         out = new DataOutputStream(socket.getOutputStream());
         in = new DataInputStream(socket.getInputStream());
-
         out.writeUTF("PUBKEY::" + username + "::" + RSAUtil.getPublicKeyString());
-
         new Thread(() -> {
             try {
                 while (true) {
@@ -42,35 +74,37 @@ public class ChatClient {
                         if (targetUser.equals(this.username)) {
                             String aesKeyDecoded = RSAUtil.decrypt(encryptedAesKey, RSAUtil.keyPair.getPrivate());
                             AESUtil.secretKey = new javax.crypto.spec.SecretKeySpec(Base64.getDecoder().decode(aesKeyDecoded), "AES");
-                            System.out.println("🔐 AES key received and set from: " + targetUser);
+                            onMessageReceived.accept("🔐 AES key received and set from: " + targetUser);
                         }
                     } else {
                         try {
                             String decrypted = AESUtil.decrypt(msg, AESUtil.secretKey);
 
                             if (decrypted.startsWith("[FILE]||")) {
-                                // Extract the content part (without the hash)
                                 String[] hashParts = decrypted.split("::", 2);
                                 if (hashParts.length == 2) {
                                     String fileContent = hashParts[0];
                                     String hash = hashParts[1];
                                     
-                                    // Verify hash
                                     if (HashUtil.verifyHash(fileContent, hash)) {
-                                        // Now process the file content
-                                        String[] parts = fileContent.split("\\|\\|", 3);
-                                        if (parts.length == 3) {
-                                            String fileName = parts[1];
+                                        String[] parts = fileContent.split("\\|\\|", 4);
+                                        if (parts.length == 4) {
+                                            String sender = parts[1];
+                                            String fileName = parts[2];
                                             try {
-                                                byte[] fileData = Base64.getDecoder().decode(parts[2]);
-                                                File outputFile = new File("received_" + fileName);
-                                                try (FileOutputStream fos = new FileOutputStream(outputFile)) {
-                                                    fos.write(fileData);
+                                                byte[] fileData = Base64.getDecoder().decode(parts[3]);
+                                                
+                                                int requestId = ++fileRequestCounter;
+                                                FileReceiveRequest request = new FileReceiveRequest(
+                                                    sender, fileName, fileData, requestId);
+                                                pendingFileRequests.put(String.valueOf(requestId), request);
+                                                
+                                                if (onFileReceived != null) {
+                                                    onFileReceived.accept(request);
                                                 }
-                                                onMessageReceived.accept("📥 Received file: " + outputFile.getName());
                                             } catch (IllegalArgumentException e) {
-                                                // Base64 decoding failed
                                                 onMessageReceived.accept("⚠️ File decode error: " + e.getMessage());
+                                                e.printStackTrace();
                                             }
                                         } else {
                                             onMessageReceived.accept("⚠️ Malformed file message structure.");
@@ -87,14 +121,13 @@ public class ChatClient {
                                     String hash = parts[1];
                                     String plain = parts[0];
                                     if (HashUtil.verifyHash(plain, hash)) {
-                                        // Split to get username and message
                                         String[] messageParts = plain.split(":", 2);
                                         if (messageParts.length == 2) {
                                             String sender = messageParts[0];
                                             String content = messageParts[1];
                                             onMessageReceived.accept(sender + ": " + content);
                                         } else {
-                                            onMessageReceived.accept(plain); // Fallback for old format
+                                            onMessageReceived.accept(plain);
                                         }
                                     } else {
                                         onMessageReceived.accept("⚠️ Message integrity check failed.");
@@ -105,17 +138,16 @@ public class ChatClient {
                             }
                         } catch (Exception e) {
                             onMessageReceived.accept("⚠️ Decryption error: " + e.getMessage());
-                            e.printStackTrace(); // For debugging
+                            e.printStackTrace();
                         }
                     }
                 }
             } catch (Exception e) {
                 onMessageReceived.accept("⚠️ Error: " + e.getMessage());
-                e.printStackTrace(); // For debugging
+                e.printStackTrace();
             }
         }).start();
     }
-
     public void sendMessage(String msg) throws Exception {
         String messageWithUser = username + ":" + msg;
         String hash = HashUtil.generateHash(messageWithUser);
@@ -128,7 +160,7 @@ public class ChatClient {
         try (FileInputStream fis = new FileInputStream(file)) {
             byte[] fileBytes = fis.readAllBytes();
             String encoded = Base64.getEncoder().encodeToString(fileBytes);
-            String fileMessage = "[FILE]||" + file.getName() + "||" + encoded;
+            String fileMessage = "[FILE]||" + username + "||" + file.getName() + "||" + encoded;
             String hash = HashUtil.generateHash(fileMessage);
             String withHash = fileMessage + "::" + hash;
             String encrypted = AESUtil.encrypt(withHash, AESUtil.secretKey);
@@ -137,5 +169,14 @@ public class ChatClient {
     }
     public void setOnMessageReceived(Consumer<String> callback) {
         this.onMessageReceived = callback;
+    }
+    public void setOnFileReceived(Consumer<FileReceiveRequest> callback) {
+        this.onFileReceived = callback;
+    }
+    public FileReceiveRequest getFileRequest(String requestId) {
+        return pendingFileRequests.get(requestId);
+    }
+    public void removeFileRequest(String requestId) {
+        pendingFileRequests.remove(requestId);
     }
 }
